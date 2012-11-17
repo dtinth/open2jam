@@ -109,8 +109,13 @@ public class Render implements GameWindowCallback
     /** the note distance calculator */
     private NoteDistanceCalculator distance;
     
-    private boolean gameStarted = true;
-
+    /** flag telling the game to start */
+    private boolean gameStarted = false;
+    private boolean startPaused = false;
+    
+    private BlockingProcedure loading = null;
+    private List<BlockingProcedure> blockList = Collections.synchronizedList(new LinkedList<BlockingProcedure>());
+    
     /** the layer of the notes */
     private int note_layer;
 
@@ -206,7 +211,7 @@ public class Render implements GameWindowCallback
 
     protected Entity judgment_line;
     
-    TrueTypeFont trueTypeFont;
+    TrueTypeFont trueTypeFont = null;
 
     /** statistics variable */
     double total_notes = 0;
@@ -238,6 +243,18 @@ public class Render implements GameWindowCallback
     
     /** status list */
     private StatusList statusList = new StatusList();
+    private List<StatusItem> statusQueue = new LinkedList<StatusItem>();
+    
+    /**
+     * A scene interface
+     */
+    private interface Scene {
+        void frameRendering();
+    }
+    
+    double initialiseTime;
+    private Scene currentScene = new EyecatchScene();
+    private Sprite eyecatch;
 
     static {
         ResourceFactory.get().setRenderingType(ResourceFactory.OPENGL_LWJGL);
@@ -251,12 +268,10 @@ public class Render implements GameWindowCallback
         keyboard_map = Config.getKeyboardMap(Config.KeyboardType.K7);
         keyboard_misc = Config.getKeyboardMisc();
         window = ResourceFactory.get().getGameWindow();
-        
         soundSystem = new FmodExSoundSystem();
         soundSystem.setMasterVolume(opt.getMasterVolume());
         soundSystem.setBGMVolume(opt.getBGMVolume());
         soundSystem.setKeyVolume(opt.getKeyVolume());
-        
         entities_matrix = new EntityMatrix();
         this.chart = chart;
         this.opt = opt;
@@ -306,7 +321,7 @@ public class Render implements GameWindowCallback
         displayLatency = new Latency(opt.getDisplayLag());
         audioLatency = new Latency(opt.getAudioLatency());
         
-        statusList.add(new StatusItem() {
+        statusQueue.add(new StatusItem() {
 
             @Override
             public String getText() {
@@ -317,7 +332,7 @@ public class Render implements GameWindowCallback
             public boolean isVisible() { return true; }
         });
         
-        statusList.add(new StatusItem() {
+        statusQueue.add(new StatusItem() {
 
             @Override
             public String getText() {
@@ -348,7 +363,7 @@ public class Render implements GameWindowCallback
     }
     
     public void setStartPaused() {
-        this.gameStarted = false;
+        this.startPaused = true;
     }
     
     public void setLocalMatchingServer(String text) {
@@ -359,6 +374,9 @@ public class Render implements GameWindowCallback
         this.rank = rank;
     }
 
+    public void logTime(String message) {
+        System.err.printf("[%d] %s\n", System.currentTimeMillis(), message);
+    }
     
     /**
     * initialize the common elements for the game.
@@ -367,7 +385,7 @@ public class Render implements GameWindowCallback
     @Override
     public void initialise()
     {
-        lastLoopTime = SystemTimer.getTime();
+        initialiseTime = lastLoopTime = SystemTimer.getTime();
 
         // skin load
         try {
@@ -389,7 +407,9 @@ public class Render implements GameWindowCallback
             BufferedImage img = chart.getCover();
             Sprite s = ResourceFactory.get().getSprite(img);
             s.setScale(skin.getScreenScaleX(), skin.getScreenScaleY());
+            s.setAlpha(0);
             s.draw(0, 0);
+            eyecatch = s;
             window.update();
         } catch (NullPointerException e){
             Logger.global.log(Level.INFO, "No cover image on file: {0}", chart.getSource().getName());
@@ -499,25 +519,69 @@ public class Render implements GameWindowCallback
 	entities_matrix.add(bgaEntity);
 	
 	bga_sprites = new HashMap<Integer, Sprite>();
+        
 	if(chart.hasVideo()) {
 	    bgaEntity.isVideo = true;
 	    bgaEntity.videoFile = chart.getVideo();
 	    bgaEntity.initVideo();
 	} else if(!chart.getBgaIndex().isEmpty()) {
-	    // get all the bgaEntity sprites
-	    
-	    for(Entry<Integer, File> entry: chart.getImages().entrySet()) {
-		BufferedImage img;
-		try {
-		    img = ImageIO.read(entry.getValue());
-		    Sprite s = ResourceFactory.get().getSprite(img);
-		    bga_sprites.put(entry.getKey(), s);
-		} catch (IOException ex) {
-		    java.util.logging.Logger.getLogger(Render.class.getName()).log(Level.SEVERE, null, ex);
-		}    
-	    }
+            Map<Integer, Sprite> map = new HashMap<Integer, Sprite>();
+            int size = chart.getImages().size(), i = 0;
+            for(Entry<Integer, File> entry: chart.getImages().entrySet()) {
+                BufferedImage img;
+                try {
+                    img = ImageIO.read(entry.getValue());
+                    Sprite s = ResourceFactory.get().getSprite(img);
+                    map.put(entry.getKey(), s);
+                } catch (IOException ex) {
+                    java.util.logging.Logger.getLogger(Render.class.getName()).log(Level.SEVERE, null, ex);
+                }    
+            }
+            bga_sprites = map;
 	}
-	
+        
+        if (trueTypeFont == null) {
+            trueTypeFont = new TrueTypeFont(new Font("Tahoma", Font.BOLD, 14), false);
+        }
+        
+        LoadingProcedure procedure = new LoadingProcedure() {
+            
+            @Override
+            protected void work() {
+                loadKeysounds();
+                loading = null;
+            }
+
+            private void loadKeysounds() {
+                HashMap<Integer, Sound> map = new HashMap<Integer, Sound>();
+                int size = chart.getSamples().size(), i = 0;
+                for(Entry<Integer, SampleData> entry : chart.getSamples().entrySet())
+                {
+                    SampleData sampleData = entry.getValue();
+                    setStatus("Loading sound " + ++i + "/" + size);
+                    try {
+                        Sound sound = soundSystem.load(sampleData);
+                        map.put(entry.getKey(), sound);
+                    } catch (SoundSystemException ex) {
+                        java.util.logging.Logger.getLogger(Render.class.getName()).log(Level.SEVERE, null, ex);
+                    }
+                    try {
+                        entry.getValue().dispose();
+                    } catch (IOException ex) {
+                        java.util.logging.Logger.getLogger(Render.class.getName()).log(Level.SEVERE, null, ex);
+                    }
+                }
+                sounds = map;
+            }
+
+        };
+        
+        loading = procedure;
+        
+        statusList.add(procedure);
+        addBlock(procedure);
+        procedure.start();
+        
         // adding static entities
         for(Entity e : skin.getEntityList()){
             entities_matrix.add(e);
@@ -531,29 +595,10 @@ public class Render implements GameWindowCallback
 
         // get the chart sound samples
 	sounds = new HashMap<Integer, Sound>();
-        for(Entry<Integer, SampleData> entry : chart.getSamples().entrySet())
-        {
-            SampleData sampleData = entry.getValue();
-            try {
-                Sound sound = soundSystem.load(sampleData);
-                sounds.put(entry.getKey(), sound);
-            } catch (SoundSystemException ex) {
-                java.util.logging.Logger.getLogger(Render.class.getName()).log(Level.SEVERE, null, ex);
-            }
-	    try {
-		entry.getValue().dispose();
-	    } catch (IOException ex) {
-		java.util.logging.Logger.getLogger(Render.class.getName()).log(Level.SEVERE, null, ex);
-	    }
-	}
 	
-        trueTypeFont = new TrueTypeFont(new Font("Tahoma", Font.BOLD, 14), false);
         
         //clean up
         System.gc();
-
-        // wait a bit.. 5 seconds at min
-        SystemTimer.sleep((int) (5000 - (SystemTimer.getTime() - lastLoopTime)));
 
         lastLoopTime = SystemTimer.getTime();
         start_time = lastLoopTime + DELAY_TIME;
@@ -573,7 +618,7 @@ public class Render implements GameWindowCallback
             
             gameStarted = false;
             new Thread(localMatching).start();
-            statusList.add(new StatusItem() {
+            statusQueue.add(new StatusItem() {
 
                 @Override
                 public String getText() {
@@ -583,10 +628,17 @@ public class Render implements GameWindowCallback
                 @Override
                 public boolean isVisible() { return true; }
             });
-	
-        } else if (!gameStarted) {
             
-            statusList.add(new StatusItem() {
+            addBlock(new BlockingProcedure() {
+                @Override
+                public boolean isDone() {
+                    return localMatching.isReady();
+                }
+            });
+	
+        } else if (startPaused) {
+            
+            statusQueue.add(new StatusItem() {
 
                 @Override
                 public String getText() {
@@ -595,6 +647,13 @@ public class Render implements GameWindowCallback
 
                 @Override
                 public boolean isVisible() { return !gameStarted; }
+            });
+            
+            addBlock(new BlockingProcedure() {
+                @Override
+                public boolean isDone() {
+                    return !startPaused;
+                }
             });
             
         }
@@ -635,115 +694,181 @@ public class Render implements GameWindowCallback
         }
 
     }
+    
+    private void addBlock(BlockingProcedure block) {
+        if (blockList == null) return;
+        blockList.add(block);
+    }
+    
+    private void updateBlocks() {
+        if (blockList == null) return;
+        synchronized(blockList) {
+            Iterator<BlockingProcedure> it = blockList.iterator();
+            while (it.hasNext()) {
+                BlockingProcedure p = it.next();
+                if (p.isDone()) {
+                    it.remove();
+                }
+            }
+            if (blockList.size() == 0) {
+                blockList = null;
+                gameStarted = true;
+            }
+        }
+    }
+    
+    private class EyecatchScene implements Scene {
 
+        boolean rendered = false;
+        double start;
+        
+        @Override
+        public void frameRendering() {
+            
+            if (rendered == false) {
+                rendered = true;
+                start = SystemTimer.getTime();
+            }
+            double elapsed = SystemTimer.getTime() - start;
+            
+            eyecatch.setAlpha((float)Math.min(1, Math.max(0, elapsed / 1000)));
+            eyecatch.draw(0, 0);
+            
+            drawStatuses();
+            
+            if (SystemTimer.getTime() - initialiseTime > 5000 && loading == null) {
+                lastLoopTime = start_time = SystemTimer.getTime();
+                for (StatusItem s : statusQueue) {
+                    statusList.add(s);
+                }
+                currentScene = new GameScene();
+            }
+            
+        }
+        
+    }
+    
+    private class GameScene implements Scene {
+        
+        @Override
+        public void frameRendering() {
+            
+            // work out how long its been since the last update, this
+            // will be used to calculate how far the entities should
+            // move this loop
+            double now = SystemTimer.getTime();
+            double delta = now - lastLoopTime;
+            lastLoopTime = now;
+            lastFpsTime += delta;
+            fps++;
+
+            update_fps_counter();
+
+            check_misc_keyboard();
+
+            changeSpeed(delta); // TODO: is everything here really needed every frame ?
+
+            updateBlocks();
+            
+            if (!gameStarted) {
+                start_time = SystemTimer.getTime();
+            }
+
+            now = SystemTimer.getTime() - start_time;
+
+            if (AUTOSOUND) now -= audioLatency.getLatency();
+
+            double now_display = now + displayLatency.getLatency();
+
+            update_note_buffer(now, now_display);
+            distance.update(now_display, delta);
+
+            soundSystem.update();
+            do_autoplay(now);
+            Keyboard.poll();
+            check_keyboard(now);
+
+            for(LinkedList<Entity> layer : entities_matrix) // loop over layers
+            {
+                // get entity iterator from layer
+                // need to use iterator here because we remove() below
+                Iterator<Entity> j = layer.iterator();
+                while(j.hasNext()) // loop over entities
+                {
+                    Entity e = j.next();
+                    e.move(delta); // move the entity
+
+                    if(e instanceof TimeEntity)
+                    {
+                        TimeEntity te = (TimeEntity) e;
+                        //autoplays sounds play
+
+                        double timeToJudge = now;
+
+                        if (e instanceof SoundEntity && AUTOSOUND) {
+                            timeToJudge += audioLatency.getLatency();
+                        }
+
+                        if(te.getTime() - timeToJudge <= 0) te.judgment();
+
+                        NoteEntity ne = e instanceof NoteEntity ? (NoteEntity)e : null;
+
+                        double y = getViewport() - distance.calculate(now_display, te.getTime(), speed, ne);
+
+                        //TODO Fix this, maybe an option in the skin
+                        //o2jam overlaps 1 px of the note with the measure and, because of this
+                        //our skin should do it too xD
+                        if(e instanceof MeasureEntity) y -= 1;
+
+                        if(!(e instanceof BgaEntity))
+                            e.setPos(e.getX(), y);
+
+                        if(e instanceof LongNoteEntity) {
+                            LongNoteEntity lne = (LongNoteEntity)e;
+                            double ey = getViewport() - distance.calculate(now_display, lne.getEndTime(), speed, ne);
+                            lne.setEndDistance(Math.abs(ey - y));
+                        }
+
+                        if(e instanceof NoteEntity) check_judgment((NoteEntity)e, now);
+                    }
+
+                    if(e.isDead())j.remove();
+                    else e.draw();
+                }
+            }
+
+            drawStatuses();
+
+            if(!buffer_iterator.hasNext() && entities_matrix.isEmpty(note_layer)){
+                if (finish_time == -1) {
+                    finish_time = System.currentTimeMillis() + 10000;
+                } else if (System.currentTimeMillis() > finish_time) {
+                    soundSystem.release();
+                    window.destroy();
+                }
+            }
+
+            
+        }
+        
+    }
 
     /**
-    * Notification that a frame is being rendered. Responsible for
-    * running game logic and rendering the scene.
-    */
+     * Notification that a frame is being rendered. Responsible for
+     * running game logic and rendering the scene.
+     */
     @Override
     public void frameRendering()
     {
-        // work out how long its been since the last update, this
-        // will be used to calculate how far the entities should
-        // move this loop
-        double now = SystemTimer.getTime();
-        double delta = now - lastLoopTime;
-        lastLoopTime = now;
-        lastFpsTime += delta;
-        fps++;
-
-        update_fps_counter();
-
-        check_misc_keyboard();
-        
-        changeSpeed(delta); // TODO: is everything here really needed every frame ?
-
-        if (!gameStarted && localMatching != null) {
-            if (localMatching.isReady()) gameStarted = true;
-        }
-        
-        if (!gameStarted) {
-            start_time = SystemTimer.getTime();
-        }
-        
-        now = SystemTimer.getTime() - start_time;
-
-        if (AUTOSOUND) now -= audioLatency.getLatency();
-        
-        double now_display = now + displayLatency.getLatency();
-        
-        update_note_buffer(now, now_display);
-        distance.update(now_display, delta);
-
-        soundSystem.update();
-	do_autoplay(now);
-        Keyboard.poll();
-        check_keyboard(now);
-        
-        for(LinkedList<Entity> layer : entities_matrix) // loop over layers
-        {
-            // get entity iterator from layer
-            // need to use iterator here because we remove() below
-            Iterator<Entity> j = layer.iterator();
-            while(j.hasNext()) // loop over entities
-            {
-                Entity e = j.next();
-                e.move(delta); // move the entity
-
-                if(e instanceof TimeEntity)
-                {
-                    TimeEntity te = (TimeEntity) e;
-                    //autoplays sounds play
-                    
-                    double timeToJudge = now;
-                    
-                    if (e instanceof SoundEntity && AUTOSOUND) {
-                        timeToJudge += audioLatency.getLatency();
-                    }
-                    
-                    if(te.getTime() - timeToJudge <= 0) te.judgment();
-
-                    NoteEntity ne = e instanceof NoteEntity ? (NoteEntity)e : null;
-                    
-                    double y = getViewport() - distance.calculate(now_display, te.getTime(), speed, ne);
-
-                    //TODO Fix this, maybe an option in the skin
-                    //o2jam overlaps 1 px of the note with the measure and, because of this
-                    //our skin should do it too xD
-                    if(e instanceof MeasureEntity) y -= 1;
-                    
-		    if(!(e instanceof BgaEntity))
-			e.setPos(e.getX(), y);
-                    
-                    if(e instanceof LongNoteEntity) {
-                        LongNoteEntity lne = (LongNoteEntity)e;
-                        double ey = getViewport() - distance.calculate(now_display, lne.getEndTime(), speed, ne);
-                        lne.setEndDistance(Math.abs(ey - y));
-                    }
-
-                    if(e instanceof NoteEntity) check_judgment((NoteEntity)e, now);
-                }
-
-                if(e.isDead())j.remove();
-                else e.draw();
-            }
-        }
-
+        currentScene.frameRendering();
+    }
+    
+    private void drawStatuses() {
         int y = 300;
-        
+        if (trueTypeFont == null) return;
         for (String s : statusList) {
             trueTypeFont.drawString(780, y, s, 1, -1, TrueTypeFont.ALIGN_RIGHT);
             y += 30;
-        }
-        
-        if(!buffer_iterator.hasNext() && entities_matrix.isEmpty(note_layer)){
-            if (finish_time == -1) {
-                finish_time = System.currentTimeMillis() + 10000;
-            } else if (System.currentTimeMillis() > finish_time) {
-                soundSystem.release();
-                window.destroy();
-            }
         }
     }
 
@@ -825,8 +950,7 @@ public class Render implements GameWindowCallback
             
             if(keyDown && !keyWasDown){ // started holding now
                 
-                if (!gameStarted && localMatching == null) gameStarted = true;  
-                
+                startPaused = false;
                 keyboard_key_pressed.put(c, true);
 
                 Entity ee = skin.getEntityMap().get("PRESSED_"+c).copy();
